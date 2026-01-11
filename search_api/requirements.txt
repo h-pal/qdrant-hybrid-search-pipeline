@@ -1,8 +1,6 @@
 qdrant-client
 fastembed
 python-dotenv
-boto3
-tqdm
 fastapi
 uvicorn
 pydantic

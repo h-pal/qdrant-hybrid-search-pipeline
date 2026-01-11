@@ -18,6 +18,12 @@ Expected improvements:
 - Qdrant search: ~45ms → ~35ms (384 vs 512 dimensions)
 - Search quality: Maintained (reranker compensates)
 - Total: ~190ms → ~137ms
+- Indexing: Parallel processing with 8 workers (utilizes 32-core CPU)
+
+Performance:
+- With 8 parallel workers: ~15-20 minutes for 100 batches
+- Each worker processes batches independently
+- Deterministic IDs prevent collisions (batch_num * 10000 + idx)
 
 Usage:
     python optimize_collection.py
@@ -28,6 +34,7 @@ import sys
 import time
 import boto3
 from typing import List, Dict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     VectorParams,
@@ -43,7 +50,6 @@ from qdrant_client.models import (
     SparseVector
 )
 from fastembed import SparseTextEmbedding, TextEmbedding
-from tqdm import tqdm
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -57,6 +63,7 @@ EMBEDDING_DIMENSION = 384  # bge-small uses 384 dimensions
 BATCH_SIZE = 32  # Process 32 ads at a time
 START_BATCH = 1
 END_BATCH = 100
+NUM_WORKERS = 8  # Number of parallel workers (32 cores / 4 cores per worker)
 
 # AWS S3 Configuration
 BUCKET_URL = os.environ.get("BUCKET_URL", "https://storage.railway.app")
@@ -111,8 +118,8 @@ def create_optimized_collection(qdrant_client: QdrantClient):
             memmap_threshold=None       # Disable memmap (force RAM)
         ),
         hnsw_config=HnswConfigDiff(
-            m=16,  # Number of connections per element (optimal for 100K vectors)
-            ef_construct=100,  # Construction time vs accuracy tradeoff
+            m=32,  # Number of connections per element (optimal for 100K vectors)
+            ef_construct=200,  # Construction time vs accuracy tradeoff
             full_scan_threshold=10000,
             on_disk=False  # Keep HNSW index in RAM for speed
         ),
@@ -166,6 +173,118 @@ def generate_embeddings(embedding_model: TextEmbedding, texts: List[str]) -> Lis
         raise e
 
 
+def process_single_batch_worker(batch_num: int) -> int:
+    """
+    Worker function that processes a single batch (runs in separate process).
+    Each worker initializes its own models and processes one batch.
+    """
+    # Initialize models in this worker process
+    embedding_model = TextEmbedding(model_name=EMBEDDING_MODEL)
+    sparse_model = SparseTextEmbedding(model_name=SPARSE_MODEL)
+
+    # Initialize Qdrant client
+    qdrant_client = QdrantClient(
+        url=QDRANT_URL,
+        timeout=60.0
+    )
+
+    # Initialize S3 client
+    s3_client = boto3.client(
+        's3',
+        endpoint_url=BUCKET_URL,
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY
+    )
+
+    # Download batch
+    ads = download_batch_from_s3(s3_client, BUCKET_NAME, batch_num)
+    if not ads:
+        return 0
+
+    # Extract texts
+    texts = []
+    valid_ads = []
+    for ad in ads:
+        description_long = ad.get("description_long", "").strip()
+        if description_long:
+            texts.append(description_long)
+            valid_ads.append(ad)
+
+    if not texts:
+        return 0
+
+    # Generate DENSE embeddings in chunks (better for CPU)
+    all_dense_embeddings = []
+    CPU_BATCH_SIZE = 256  # Larger batches for parallel workers
+    for i in range(0, len(texts), CPU_BATCH_SIZE):
+        batch_texts = texts[i:i + CPU_BATCH_SIZE]
+        batch_embeddings = generate_embeddings(embedding_model, batch_texts)
+        all_dense_embeddings.extend(batch_embeddings)
+
+    # Generate SPARSE embeddings
+    sparse_embeddings = list(sparse_model.embed(texts))
+
+    # Prepare points with DETERMINISTIC IDs based on batch number
+    points = []
+    base_id = batch_num * 10000  # Each batch gets 10,000 ID slots
+    for idx, (ad, dense_embedding, sparse_embedding) in enumerate(zip(valid_ads, all_dense_embeddings, sparse_embeddings)):
+        sparse_vector = SparseVector(
+            indices=sparse_embedding.indices.tolist(),
+            values=sparse_embedding.values.tolist()
+        )
+
+        point = PointStruct(
+            id=base_id + idx,  # Deterministic ID
+            vector={
+                "dense": dense_embedding,
+                "sparse": sparse_vector
+            },
+            payload={
+                "id": ad.get("id"),
+                "brand_name": ad.get("brand_name"),
+                "name": ad.get("name"),
+                "title": ad.get("title"),
+                "description": ad.get("description"),
+                "description_long": ad.get("description_long"),
+                "price": ad.get("price"),
+                "landing_page": ad.get("landing_page"),
+                "bucket_names": ad.get("bucket_names", []),
+                "category": ad.get("category"),
+                "domain": ad.get("domain"),
+                "og_image": ad.get("og_image"),
+                "ad_quality_score": ad.get("ad_quality_score")
+            }
+        )
+        points.append(point)
+
+    # Upload to Qdrant in chunks
+    UPLOAD_CHUNK_SIZE = 100
+    total_uploaded = 0
+    for chunk_start in range(0, len(points), UPLOAD_CHUNK_SIZE):
+        chunk_end = min(chunk_start + UPLOAD_CHUNK_SIZE, len(points))
+        chunk_points = points[chunk_start:chunk_end]
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                qdrant_client.upsert(
+                    collection_name=NEW_COLLECTION_NAME,
+                    points=chunk_points,
+                    wait=False
+                )
+                total_uploaded += len(chunk_points)
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    time.sleep(wait_time)
+                else:
+                    print(f"❌ Batch {batch_num} upload failed after {max_retries} attempts: {e}")
+                    raise e
+
+    return total_uploaded
+
+
 def process_and_upload_batch(
     ads: List[Dict],
     embedding_model: TextEmbedding,
@@ -173,7 +292,7 @@ def process_and_upload_batch(
     qdrant_client: QdrantClient,
     start_idx: int
 ) -> int:
-    """Process ads batch and upload to Qdrant with HYBRID embeddings."""
+    """Process ads batch and upload to Qdrant with HYBRID embeddings (LEGACY - not used in parallel mode)."""
     # Extract description_long for embedding
     texts = []
     valid_ads = []
@@ -187,8 +306,14 @@ def process_and_upload_batch(
     if not texts:
         return 0
 
-    # Generate DENSE embeddings locally (much faster than API calls)
-    all_dense_embeddings = generate_embeddings(embedding_model, texts)
+    # Generate DENSE embeddings in batches (better for CPU)
+    # Process in smaller chunks for better CPU performance
+    all_dense_embeddings = []
+    CPU_BATCH_SIZE = 256  # Larger batches for efficiency
+    for i in range(0, len(texts), CPU_BATCH_SIZE):
+        batch_texts = texts[i:i + CPU_BATCH_SIZE]
+        batch_embeddings = generate_embeddings(embedding_model, batch_texts)
+        all_dense_embeddings.extend(batch_embeddings)
 
     # Generate SPARSE embeddings (BM25) for all texts at once
     sparse_embeddings = list(sparse_model.embed(texts))
@@ -268,50 +393,61 @@ def main():
     print(f"Target: Sub-10ms Qdrant searches")
     print()
 
-    # Initialize clients
-    print("📡 Connecting to services...")
+    # Initialize Qdrant client (for collection creation only)
+    print("📡 Connecting to Qdrant...")
     qdrant_client = QdrantClient(
         url=QDRANT_URL,
         timeout=60.0  # 60 second timeout for Railway network
     )
     print(f"✅ Connected to Qdrant at {QDRANT_URL}")
-
-    # Initialize dense embedding model (local, no API key needed)
-    print(f"🔍 Loading dense embedding model ({EMBEDDING_MODEL})...")
-    embedding_model = TextEmbedding(model_name=EMBEDDING_MODEL)
-    print(f"✅ Dense embedding model loaded (384 dimensions)")
-
-    # Initialize sparse embedding model for BM25
-    print(f"🔍 Loading BM25 sparse embedding model ({SPARSE_MODEL})...")
-    sparse_model = SparseTextEmbedding(model_name=SPARSE_MODEL)
-    print(f"✅ BM25 model loaded")
-
-    s3_client = boto3.client(
-        's3',
-        endpoint_url=BUCKET_URL,
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY
-    )
-    print(f"✅ Connected to S3 bucket")
+    print()
+    print(f"Note: Each parallel worker will load its own models ({NUM_WORKERS} workers)")
     print()
 
     # Create optimized collection
     create_optimized_collection(qdrant_client)
 
-    # Process all batches
-    print(f"📥 Processing {END_BATCH - START_BATCH + 1} batches...")
+    # Process all batches IN PARALLEL
+    print(f"📥 Processing {END_BATCH - START_BATCH + 1} batches in parallel with {NUM_WORKERS} workers...")
+    print(f"   Using {NUM_WORKERS} CPU cores (~4 cores per worker)")
     print()
 
     total_ads = 0
-    current_idx = 0
+    completed_batches = 0
+    total_batches = END_BATCH - START_BATCH + 1
 
-    for batch_num in tqdm(range(START_BATCH, END_BATCH + 1), desc="Processing batches"):
-        ads = download_batch_from_s3(s3_client, BUCKET_NAME, batch_num)
+    # Use ProcessPoolExecutor for parallel processing
+    with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        # Submit all batches to the pool
+        future_to_batch = {
+            executor.submit(process_single_batch_worker, batch_num): batch_num
+            for batch_num in range(START_BATCH, END_BATCH + 1)
+        }
 
-        if ads:
-            count = process_and_upload_batch(ads, embedding_model, sparse_model, qdrant_client, current_idx)
-            total_ads += count
-            current_idx += count
+        # Process results as they complete
+        for future in as_completed(future_to_batch):
+            batch_num = future_to_batch[future]
+            try:
+                count = future.result()
+                total_ads += count
+                completed_batches += 1
+                progress = (completed_batches / total_batches) * 100
+                print(f"✅ Batch {batch_num:3d} complete ({count:4d} ads) | Progress: {completed_batches}/{total_batches} ({progress:.1f}%)")
+            except Exception as e:
+                print(f"❌ Batch {batch_num} failed: {e}")
+
+    print()
+    print(f"✅ All {total_batches} batches processed! Total ads: {total_ads:,}")
+
+    print("⏳ Waiting for indexing to finish...")
+    while True:
+        info = qdrant_client.get_collection(NEW_COLLECTION_NAME)
+        if info.status == "green":
+            break
+        print(f"   Status: {info.status}... waiting 2s")
+        time.sleep(2)
+        
+    print(f"✅ Optimization Complete! Collection '{NEW_COLLECTION_NAME}' is GREEN and ready.")
 
     print()
     print("="*80)
