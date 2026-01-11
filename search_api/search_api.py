@@ -52,7 +52,8 @@ sparse_model: Optional[SparseTextEmbedding] = None
 reranker: Optional[Ranker] = None
 
 # Thread Executor for Parallel Embedding
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+# Optimized for 32 vCPU deployment - allow more concurrent requests
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
 
 
 @app.on_event("startup")
@@ -102,8 +103,8 @@ def startup_event():
 
     # 4. Initialize FlashRank Reranker (CPU-based, ultra-fast)
     logger.info("Loading FlashRank Reranker...")
-    reranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir="/tmp")
-    logger.info("✅ FlashRank Reranker Loaded (ms-marco-MiniLM-L-12-v2)")
+    reranker = Ranker(model_name="ms-marco-TinyBERT-L-2-v2", cache_dir="/tmp")
+    logger.info("✅ FlashRank Reranker Loaded (ms-marco-TinyBERT-L-2-v2)")
 
 
 # --- HELPER FUNCTIONS (Run in Threads) ---
@@ -280,7 +281,7 @@ def search_ads(request: SearchRequest):
         # Map reranked results back to points (FlashRank returns sorted results with scores)
         scored_points = []
         for result in rerank_results:
-            point_idx = result['id']
+            point_idx = int(result['id'])
             score = result['score']
             scored_points.append((score, points_list[point_idx]))
 
