@@ -63,6 +63,11 @@ def startup_event():
     global qdrant_client, dense_model, sparse_model, reranker
     logger.info("🚀 Starting Search API Initialization...")
 
+    # Log threading configuration for verification
+    omp_threads = os.environ.get("OMP_NUM_THREADS", "NOT SET")
+    mkl_threads = os.environ.get("MKL_NUM_THREADS", "NOT SET")
+    logger.info(f"🧵 Thread Config: OMP_NUM_THREADS={omp_threads}, MKL_NUM_THREADS={mkl_threads}")
+
     # 1. Initialize Qdrant
     qdrant_url = os.environ.get("QDRANT_URL")
     qdrant_api_key = os.environ.get("QDRANT_API_KEY")
@@ -353,4 +358,4 @@ def search_ads_get(
 if __name__ == "__main__":
     import uvicorn
     # Workers=1 is fine because we use ThreadPoolExecutor for concurrency
-    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)
+    uvicorn.run(app, host="0.0.0.0", port=8000, workers=4)
