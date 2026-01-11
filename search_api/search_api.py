@@ -246,7 +246,7 @@ def search_ads(request: SearchRequest):
                     filter=search_filter,
                     limit=PREFETCH_LIMIT, # Prefetch more for better fusion
                     params=models.SearchParams(
-                        hnsw_ef=64,  # Higher = better accuracy, slower search
+                        hnsw_ef=32,  # Lower = faster search, slight accuracy trade-off
                         exact=False
                     )
                 ),
@@ -256,7 +256,7 @@ def search_ads(request: SearchRequest):
                     filter=search_filter,
                     limit=PREFETCH_LIMIT,
                     params=models.SearchParams(
-                        hnsw_ef=64,  # Higher = better accuracy, slower search
+                        hnsw_ef=32,  # Lower = faster search, slight accuracy trade-off
                         exact=False
                     )
                 ),
