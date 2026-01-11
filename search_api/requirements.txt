@@ -1,0 +1,10 @@
+qdrant-client
+voyageai
+fastembed
+python-dotenv
+boto3
+tqdm
+fastapi
+uvicorn
+pydantic
+

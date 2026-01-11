@@ -1,0 +1,27 @@
+{
+  "total_queries": 10,
+  "successful_queries": 10,
+  "timestamp": "2026-01-10T11:02:40.033366",
+  "server_latency_ms": {
+    "mean": 317.61,
+    "median": 315.56,
+    "min": 309.76,
+    "max": 327.18,
+    "stdev": 6.35
+  },
+  "client_latency_ms": {
+    "mean": 454.55,
+    "median": 420.84,
+    "min": 406.15,
+    "max": 657.43,
+    "stdev": 80.72
+  },
+  "embedding_latency_ms": {
+    "mean": 110.89,
+    "median": 109.07
+  },
+  "qdrant_search_latency_ms": {
+    "mean": 206.69,
+    "median": 206.26
+  }
+}

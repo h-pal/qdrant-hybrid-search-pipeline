@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""
+Ad Search API: Ultra-Low Latency Hybrid Search with CPU Reranking
+Architecture: Parallel Embedding -> RRF Fusion -> CPU Reranking
+Pipeline: Voyage (Dense) + BM25 (Sparse) -> Qdrant RRF -> Jina Reranker
+"""
+
+import os
+import logging
+import time
+import concurrent.futures
+from typing import List, Optional, Dict, Any
+from fastapi import FastAPI, HTTPException, Query as QueryParam
+from pydantic import BaseModel, Field
+import voyageai
+from qdrant_client import QdrantClient, models
+from fastembed import SparseTextEmbedding
+from fastembed.rerank.cross_encoder import TextCrossEncoder
+from dotenv import load_dotenv
+
+# Configure Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+
+# --- CONFIGURATION ---
+COLLECTION_NAME = "synthetic_ads_optimized"
+VOYAGE_MODEL = "voyage-3-lite"
+SPARSE_MODEL = "Qdrant/bm25"
+
+# Optimization: Only fetch fields required for the UI card
+# "description_long" is explicitly excluded to save bandwidth
+PAYLOAD_FIELDS = [
+    "id", "brand_name", "title", "price", 
+    "landing_page", "category", "bucket_names", "ad_quality_score",
+]
+
+# --- APP INITIALIZATION ---
+app = FastAPI(
+    title="Ad Search API (Tier 1 Speed)",
+    version="3.0.0",
+    description="Hybrid Search with Server-Side Fusion and Parallel Embedding"
+)
+
+# Global Clients
+qdrant_client: Optional[QdrantClient] = None
+voyage_client: Optional[voyageai.Client] = None
+sparse_model: Optional[SparseTextEmbedding] = None
+reranker: Optional[TextCrossEncoder] = None
+
+# Thread Executor for Parallel Embedding
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+
+
+@app.on_event("startup")
+def startup_event():
+    """Initialize clients and warm up models on startup."""
+    global qdrant_client, voyage_client, sparse_model, reranker
+    logger.info("🚀 Starting Search API Initialization...")
+
+    # 1. Initialize Qdrant
+    qdrant_url = os.environ.get("QDRANT_URL")
+    qdrant_api_key = os.environ.get("QDRANT_API_KEY")
+
+    # Check if gRPC should be used (only for external URLs with proper port)
+    use_grpc = os.environ.get("QDRANT_USE_GRPC", "false").lower() == "true"
+
+    try:
+        qdrant_client = QdrantClient(
+            url=qdrant_url,
+            api_key=qdrant_api_key,
+            prefer_grpc=use_grpc,  # Use gRPC only if explicitly enabled
+            timeout=30.0  # 30 second timeout for connections
+        )
+        # Quick connectivity check
+        qdrant_client.get_collections()
+
+        connection_type = "gRPC" if use_grpc else "HTTP/REST"
+        logger.info(f"✅ Qdrant Client Initialized ({connection_type})")
+    except Exception as e:
+        logger.error(f"❌ Qdrant Connection Failed: {e}")
+        raise e
+
+    # 2. Initialize Voyage AI
+    voyage_api_key = os.environ.get("VOYAGE_API_KEY")
+    if not voyage_api_key:
+        raise ValueError("Missing VOYAGE_API_KEY env var")
+    
+    voyage_client = voyageai.Client(api_key=voyage_api_key)
+    logger.info("✅ Voyage AI Client Initialized")
+
+    # 3. Initialize Sparse Model & Warmup
+    logger.info("loading Sparse Model (This may take a few seconds)...")
+    sparse_model = SparseTextEmbedding(model_name=SPARSE_MODEL)
+
+    # Warmup: Run dummy inference to load model into RAM
+    _ = list(sparse_model.query_embed("warmup query"))
+    logger.info("✅ Sparse Model Loaded & Warmed Up")
+
+    # 4. Initialize Reranker (CPU-based, very fast)
+    logger.info("Loading Jina Reranker...")
+    reranker = TextCrossEncoder(model_name="jinaai/jina-reranker-v1-turbo-en")
+    logger.info("✅ Reranker Loaded (jinaai/jina-reranker-v1-turbo-en)")
+
+
+# --- HELPER FUNCTIONS (Run in Threads) ---
+
+def get_voyage_embedding(text: str) -> List[float]:
+    """Fetch Dense Embedding from Voyage API."""
+    return voyage_client.embed(
+        texts=[text],
+        model=VOYAGE_MODEL,
+        input_type="query"
+    ).embeddings[0]
+
+
+def get_sparse_embedding(text: str) -> models.SparseVector:
+    """Generate Sparse Vector locally on CPU."""
+    # FastEmbed returns a generator, fetch the first result
+    sparse_raw = list(sparse_model.query_embed(text))[0]
+    
+    # Convert to Qdrant Native Format
+    return models.SparseVector(
+        indices=sparse_raw.indices.tolist(),
+        values=sparse_raw.values.tolist()
+    )
+
+
+# --- API MODELS ---
+
+class AdResult(BaseModel):
+    id: str
+    brand_name: Optional[str] = None
+    title: str
+    price: Optional[Any] = None
+    score: float
+    payload: Dict[str, Any]
+
+class SearchResponse(BaseModel):
+    results: List[AdResult]
+    latency_ms: float
+    breakdown: Optional[Dict[str, float]] = Field(None, description="Optional detailed latency breakdown")
+
+class SearchRequest(BaseModel):
+    query: str
+    bucket_names: Optional[List[str]] = None
+    limit: int = Field(10, le=50)
+
+
+# --- ENDPOINTS ---
+
+@app.get("/")
+def root():
+    """Root endpoint - API info."""
+    return {
+        "service": "Ad Search API",
+        "version": "3.0.0",
+        "mode": "hybrid-rrf",
+        "collection": COLLECTION_NAME,
+        "endpoints": {
+            "search": "/search",
+            "health": "/health",
+            "docs": "/docs"
+        }
+    }
+
+
+@app.get("/health")
+def health():
+    """Health check with collection info."""
+    try:
+        if not qdrant_client:
+            return {"status": "initializing"}
+
+        info = qdrant_client.get_collection(COLLECTION_NAME)
+        use_grpc = os.environ.get("QDRANT_USE_GRPC", "false").lower() == "true"
+
+        return {
+            "status": "healthy",
+            "mode": "hybrid-rrf",
+            "collection": COLLECTION_NAME,
+            "points_count": info.points_count,
+            "connection_type": "gRPC" if use_grpc else "HTTP/REST"
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return {"status": "unhealthy", "error": str(e)}
+
+
+@app.post("/search", response_model=SearchResponse)
+def search_ads(request: SearchRequest):
+    """
+    Execute Hybrid Search with Server-Side Fusion + CPU Reranking.
+    1. Parallel: Voyage (Dense) + FastEmbed (Sparse) embeddings
+    2. Server: Qdrant RRF Fusion (Dense + Sparse results)
+    3. CPU: Jina TextCrossEncoder reranking for final precision
+    """
+    try:
+        start_time = time.time()
+
+        # 1. Build Filter (if buckets provided)
+        filter_start = time.time()
+        search_filter = None
+        if request.bucket_names:
+            search_filter = models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="bucket_names",
+                        match=models.MatchAny(any=request.bucket_names)
+                    )
+                ]
+            )
+        filter_time = (time.time() - filter_start) * 1000
+
+        # 2. Parallel Embedding Generation
+        # This runs the Network call (Voyage) and CPU work (Sparse) at the same time
+        embed_start = time.time()
+        future_dense = executor.submit(get_voyage_embedding, request.query)
+        future_sparse = executor.submit(get_sparse_embedding, request.query)
+
+        dense_vector = future_dense.result()
+        sparse_vector = future_sparse.result()
+        embed_time = (time.time() - embed_start) * 1000
+
+        # 3. Server-Side RRF Fusion (The "Magic" Step)
+        # We send both vectors to Qdrant. Qdrant searches both indices,
+        # fuses the ranks internally, and returns candidates for reranking.
+        # Fetch 3x more results to give reranker better candidates
+        search_start = time.time()
+        rerank_candidates = request.limit #* 3 25
+        PREFETCH_LIMIT = 50
+        search_results = qdrant_client.query_points(
+            collection_name=COLLECTION_NAME,
+            query=models.FusionQuery(fusion=models.Fusion.RRF),
+            prefetch=[
+                models.Prefetch(
+                    query=dense_vector,
+                    using="dense",
+                    filter=search_filter,
+                    limit=rerank_candidates * 2, # Prefetch more for better fusion
+                    params=models.SearchParams(
+                        hnsw_ef=128,  # Higher = better accuracy, slower search
+                        exact=False
+                    )
+                ),
+                models.Prefetch(
+                    query=sparse_vector,
+                    using="sparse",
+                    filter=search_filter,
+                    limit=rerank_candidates * 2,
+                    params=models.SearchParams(
+                        hnsw_ef=128,  # Higher = better accuracy, slower search
+                        exact=False
+                    )
+                ),
+            ],
+            with_payload=PAYLOAD_FIELDS, # Only return fields we need
+            limit=rerank_candidates
+        )
+        search_time = (time.time() - search_start) * 1000
+
+        # 4. CPU Reranking (Jina TextCrossEncoder)
+        # Rerank RRF results using the original query for final precision
+        rerank_start = time.time()
+
+        # Prepare documents list for reranking
+        documents = []
+        points_list = []
+        for point in search_results.points:
+            brand = point.payload.get("brand_name", "")
+            title = point.payload.get("title", "")
+            doc_text = f"{brand} {title}".strip()
+            documents.append(doc_text)
+            points_list.append(point)
+
+        # Rerank using Jina TextCrossEncoder
+        # rerank() returns a list of scores (floats)
+        rerank_scores = list(reranker.rerank(request.query, documents))
+
+        # Zip scores with points and sort by score (descending)
+        scored_points = list(zip(rerank_scores, points_list))
+        scored_points.sort(key=lambda x: x[0], reverse=True)
+
+        rerank_time = (time.time() - rerank_start) * 1000
+
+        # 5. Format Top N Results after reranking
+        format_start = time.time()
+        formatted_results = []
+        for score, point in scored_points[:request.limit]:
+            formatted_results.append(
+                AdResult(
+                    id=str(point.id),
+                    brand_name=point.payload.get("brand_name"),
+                    title=point.payload.get("title"),
+                    price=point.payload.get("price"),
+                    score=float(score), # Reranker relevance score
+                    payload=point.payload
+                )
+            )
+        format_time = (time.time() - format_start) * 1000
+
+        total_latency = (time.time() - start_time) * 1000
+
+        return SearchResponse(
+            results=formatted_results,
+            latency_ms=round(total_latency, 2),
+            breakdown={
+                "filter_build_ms": round(filter_time, 2),
+                "embedding_ms": round(embed_time, 2),
+                "search_fusion_ms": round(search_time, 2),
+                "rerank_ms": round(rerank_time, 2),
+                "format_ms": round(format_time, 2)
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Search Failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/search", response_model=SearchResponse)
+def search_ads_get(
+    q: str = QueryParam(..., description="Search query"),
+    bucket_names: Optional[str] = QueryParam(None, description="Comma-separated bucket names (e.g., 'dev_tools,cloud_services')"),
+    limit: int = QueryParam(10, ge=1, le=50, description="Number of results (1-50)")
+):
+    """
+    GET endpoint for easy browser/curl testing.
+
+    Example:
+        GET /search?q=cloud%20hosting&bucket_names=cloud_services,dev_tools&limit=5
+    """
+    # Parse bucket_names from comma-separated string
+    bucket_list = None
+    if bucket_names:
+        bucket_list = [name.strip() for name in bucket_names.split(",") if name.strip()]
+
+    # Create request and use POST endpoint logic
+    request = SearchRequest(
+        query=q,
+        bucket_names=bucket_list,
+        limit=limit
+    )
+
+    return search_ads(request)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    # Workers=1 is fine because we use ThreadPoolExecutor for concurrency
+    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)
