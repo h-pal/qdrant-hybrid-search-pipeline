@@ -63,7 +63,7 @@ EMBEDDING_DIMENSION = 384  # bge-small uses 384 dimensions
 BATCH_SIZE = 32  # Process 32 ads at a time
 START_BATCH = 1
 END_BATCH = 100
-NUM_WORKERS = 8  # Number of parallel workers (32 cores / 4 cores per worker)
+NUM_WORKERS = 8  # Number of parallel workers (reduce to avoid memory issues)
 
 # AWS S3 Configuration
 BUCKET_URL = os.environ.get("BUCKET_URL", "https://storage.railway.app")
@@ -120,6 +120,7 @@ def create_optimized_collection(qdrant_client: QdrantClient):
         hnsw_config=HnswConfigDiff(
             m=32,  # Number of connections per element (optimal for 100K vectors)
             ef_construct=200,  # Construction time vs accuracy tradeoff
+            max_indexing_threads=0,
             full_scan_threshold=10000,
             on_disk=False  # Keep HNSW index in RAM for speed
         ),
@@ -178,9 +179,15 @@ def process_single_batch_worker(batch_num: int) -> int:
     Worker function that processes a single batch (runs in separate process).
     Each worker initializes its own models and processes one batch.
     """
+    import sys
+    print(f"[Worker] Starting batch {batch_num}...", flush=True)
+    sys.stdout.flush()
+
     # Initialize models in this worker process
+    print(f"[Worker {batch_num}] Loading models...", flush=True)
     embedding_model = TextEmbedding(model_name=EMBEDDING_MODEL)
     sparse_model = SparseTextEmbedding(model_name=SPARSE_MODEL)
+    print(f"[Worker {batch_num}] Models loaded", flush=True)
 
     # Initialize Qdrant client
     qdrant_client = QdrantClient(
@@ -197,9 +204,12 @@ def process_single_batch_worker(batch_num: int) -> int:
     )
 
     # Download batch
+    print(f"[Worker {batch_num}] Downloading from S3...", flush=True)
     ads = download_batch_from_s3(s3_client, BUCKET_NAME, batch_num)
     if not ads:
+        print(f"[Worker {batch_num}] No ads found", flush=True)
         return 0
+    print(f"[Worker {batch_num}] Downloaded {len(ads)} ads", flush=True)
 
     # Extract texts
     texts = []

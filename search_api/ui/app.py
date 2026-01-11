@@ -180,8 +180,8 @@ def main():
     # Title and description
     st.title("🔍 Ad Search API - Hybrid Search Demo")
     st.markdown("""
-    **Real-time hybrid search** with Dense (Voyage AI) + Sparse (BM25) vectors,
-    fused using Reciprocal Rank Fusion (RRF), then reranked with Jina AI for maximum precision.
+    **Real-time hybrid search** with Dense (bge-small) + Sparse (BM25) vectors,
+    fused using Reciprocal Rank Fusion (RRF), then reranked with FlashRank for maximum precision.
     """)
 
     # Sidebar for filters
@@ -270,7 +270,7 @@ def main():
     st.divider()
     st.markdown("""
     <div style='text-align: center; color: gray; padding: 20px;'>
-    <small>Powered by Voyage AI (Dense) + FastEmbed BM25 (Sparse) + Jina Reranker | Qdrant Vector Database | FastAPI</small>
+    <small>Powered by bge-small (Dense) + FastEmbed BM25 (Sparse) + FlashRank Reranker | Qdrant Vector Database | FastAPI</small>
     </div>
     """, unsafe_allow_html=True)
 

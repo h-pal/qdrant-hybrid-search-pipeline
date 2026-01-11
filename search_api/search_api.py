@@ -2,7 +2,7 @@
 """
 Ad Search API: Ultra-Low Latency Hybrid Search with CPU Reranking
 Architecture: Parallel Embedding -> RRF Fusion -> CPU Reranking
-Pipeline: bge-small-en-v1.5 (Dense) + BM25 (Sparse) -> Qdrant RRF -> Jina Reranker
+Pipeline: bge-small-en-v1.5 (Dense) + BM25 (Sparse) -> Qdrant RRF -> FlashRank
 """
 
 import os
@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, Query as QueryParam
 from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient, models
 from fastembed import SparseTextEmbedding, TextEmbedding
-from fastembed.rerank.cross_encoder import TextCrossEncoder
+from flashrank import Ranker, RerankRequest
 from dotenv import load_dotenv
 
 # Configure Logging
@@ -35,7 +35,7 @@ SPARSE_MODEL = "Qdrant/bm25"
 # "description_long" is explicitly excluded to save bandwidth
 PAYLOAD_FIELDS = [
     "id", "brand_name", "title", "price", 
-    "landing_page", "category", "bucket_names", "ad_quality_score",
+    "landing_page", "category", "bucket_names", "ad_quality_score", 
 ]
 
 # --- APP INITIALIZATION ---
@@ -49,7 +49,7 @@ app = FastAPI(
 qdrant_client: Optional[QdrantClient] = None
 dense_model: Optional[TextEmbedding] = None
 sparse_model: Optional[SparseTextEmbedding] = None
-reranker: Optional[TextCrossEncoder] = None
+reranker: Optional[Ranker] = None
 
 # Thread Executor for Parallel Embedding
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
@@ -100,10 +100,10 @@ def startup_event():
     _ = list(sparse_model.query_embed("warmup query"))
     logger.info("✅ Sparse Model Loaded & Warmed Up")
 
-    # 4. Initialize Reranker (CPU-based, very fast)
-    logger.info("Loading Jina Reranker...")
-    reranker = TextCrossEncoder(model_name="jinaai/jina-reranker-v1-turbo-en")
-    logger.info("✅ Reranker Loaded (jinaai/jina-reranker-v1-turbo-en)")
+    # 4. Initialize FlashRank Reranker (CPU-based, ultra-fast)
+    logger.info("Loading FlashRank Reranker...")
+    reranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir="/tmp")
+    logger.info("✅ FlashRank Reranker Loaded (ms-marco-MiniLM-L-12-v2)")
 
 
 # --- HELPER FUNCTIONS (Run in Threads) ---
@@ -193,7 +193,7 @@ def search_ads(request: SearchRequest):
     Execute Hybrid Search with Server-Side Fusion + CPU Reranking.
     1. Parallel: bge-small-en-v1.5 (Dense) + FastEmbed BM25 (Sparse) embeddings
     2. Server: Qdrant RRF Fusion (Dense + Sparse results)
-    3. CPU: Jina TextCrossEncoder reranking for final precision
+    3. CPU: FlashRank reranking for final precision (10-20x faster than Jina)
     """
     try:
         start_time = time.time()
@@ -227,7 +227,7 @@ def search_ads(request: SearchRequest):
         # fuses the ranks internally, and returns candidates for reranking.
         # Fetch 3x more results to give reranker better candidates
         search_start = time.time()
-        rerank_candidates = request.limit #* 3 25
+        rerank_candidates = 25 #request.limit * 3
         PREFETCH_LIMIT = 50
         search_results = qdrant_client.query_points(
             collection_name=COLLECTION_NAME,
@@ -237,9 +237,9 @@ def search_ads(request: SearchRequest):
                     query=dense_vector,
                     using="dense",
                     filter=search_filter,
-                    limit=rerank_candidates * 2, # Prefetch more for better fusion
+                    limit=PREFETCH_LIMIT, # Prefetch more for better fusion
                     params=models.SearchParams(
-                        hnsw_ef=128,  # Higher = better accuracy, slower search
+                        hnsw_ef=64,  # Higher = better accuracy, slower search
                         exact=False
                     )
                 ),
@@ -247,9 +247,9 @@ def search_ads(request: SearchRequest):
                     query=sparse_vector,
                     using="sparse",
                     filter=search_filter,
-                    limit=rerank_candidates * 2,
+                    limit=PREFETCH_LIMIT,
                     params=models.SearchParams(
-                        hnsw_ef=128,  # Higher = better accuracy, slower search
+                        hnsw_ef=64,  # Higher = better accuracy, slower search
                         exact=False
                     )
                 ),
@@ -259,27 +259,30 @@ def search_ads(request: SearchRequest):
         )
         search_time = (time.time() - search_start) * 1000
 
-        # 4. CPU Reranking (Jina TextCrossEncoder)
+        # 4. CPU Reranking (FlashRank)
         # Rerank RRF results using the original query for final precision
         rerank_start = time.time()
 
-        # Prepare documents list for reranking
-        documents = []
+        # Prepare passages list for FlashRank
+        passages = []
         points_list = []
-        for point in search_results.points:
+        for idx, point in enumerate(search_results.points):
             brand = point.payload.get("brand_name", "")
             title = point.payload.get("title", "")
             doc_text = f"{brand} {title}".strip()
-            documents.append(doc_text)
+            passages.append({"id": idx, "text": doc_text})
             points_list.append(point)
 
-        # Rerank using Jina TextCrossEncoder
-        # rerank() returns a list of scores (floats)
-        rerank_scores = list(reranker.rerank(request.query, documents))
+        # Rerank using FlashRank (10-20x faster than Jina)
+        rerank_request = RerankRequest(query=request.query, passages=passages)
+        rerank_results = reranker.rerank(rerank_request)
 
-        # Zip scores with points and sort by score (descending)
-        scored_points = list(zip(rerank_scores, points_list))
-        scored_points.sort(key=lambda x: x[0], reverse=True)
+        # Map reranked results back to points (FlashRank returns sorted results with scores)
+        scored_points = []
+        for result in rerank_results:
+            point_idx = result['id']
+            score = result['score']
+            scored_points.append((score, points_list[point_idx]))
 
         rerank_time = (time.time() - rerank_start) * 1000
 
