@@ -1,5 +1,4 @@
 qdrant-client
-voyageai
 fastembed
 python-dotenv
 boto3

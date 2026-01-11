@@ -2,7 +2,7 @@
 """
 Ad Search API: Ultra-Low Latency Hybrid Search with CPU Reranking
 Architecture: Parallel Embedding -> RRF Fusion -> CPU Reranking
-Pipeline: Voyage (Dense) + BM25 (Sparse) -> Qdrant RRF -> Jina Reranker
+Pipeline: bge-small-en-v1.5 (Dense) + BM25 (Sparse) -> Qdrant RRF -> Jina Reranker
 """
 
 import os
@@ -12,9 +12,8 @@ import concurrent.futures
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, Query as QueryParam
 from pydantic import BaseModel, Field
-import voyageai
 from qdrant_client import QdrantClient, models
-from fastembed import SparseTextEmbedding
+from fastembed import SparseTextEmbedding, TextEmbedding
 from fastembed.rerank.cross_encoder import TextCrossEncoder
 from dotenv import load_dotenv
 
@@ -29,7 +28,7 @@ load_dotenv()
 
 # --- CONFIGURATION ---
 COLLECTION_NAME = "synthetic_ads_optimized"
-VOYAGE_MODEL = "voyage-3-lite"
+DENSE_MODEL = "BAAI/bge-small-en-v1.5"  # Local embedding model
 SPARSE_MODEL = "Qdrant/bm25"
 
 # Optimization: Only fetch fields required for the UI card
@@ -48,7 +47,7 @@ app = FastAPI(
 
 # Global Clients
 qdrant_client: Optional[QdrantClient] = None
-voyage_client: Optional[voyageai.Client] = None
+dense_model: Optional[TextEmbedding] = None
 sparse_model: Optional[SparseTextEmbedding] = None
 reranker: Optional[TextCrossEncoder] = None
 
@@ -59,7 +58,7 @@ executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 @app.on_event("startup")
 def startup_event():
     """Initialize clients and warm up models on startup."""
-    global qdrant_client, voyage_client, sparse_model, reranker
+    global qdrant_client, dense_model, sparse_model, reranker
     logger.info("🚀 Starting Search API Initialization...")
 
     # 1. Initialize Qdrant
@@ -85,16 +84,16 @@ def startup_event():
         logger.error(f"❌ Qdrant Connection Failed: {e}")
         raise e
 
-    # 2. Initialize Voyage AI
-    voyage_api_key = os.environ.get("VOYAGE_API_KEY")
-    if not voyage_api_key:
-        raise ValueError("Missing VOYAGE_API_KEY env var")
-    
-    voyage_client = voyageai.Client(api_key=voyage_api_key)
-    logger.info("✅ Voyage AI Client Initialized")
+    # 2. Initialize Dense Embedding Model (Local)
+    logger.info(f"Loading Dense Embedding Model ({DENSE_MODEL})...")
+    dense_model = TextEmbedding(model_name=DENSE_MODEL)
+
+    # Warmup: Run dummy inference to load model into RAM
+    _ = list(dense_model.embed(["warmup query"]))
+    logger.info("✅ Dense Model Loaded & Warmed Up (384 dimensions)")
 
     # 3. Initialize Sparse Model & Warmup
-    logger.info("loading Sparse Model (This may take a few seconds)...")
+    logger.info("Loading Sparse Model (This may take a few seconds)...")
     sparse_model = SparseTextEmbedding(model_name=SPARSE_MODEL)
 
     # Warmup: Run dummy inference to load model into RAM
@@ -109,13 +108,10 @@ def startup_event():
 
 # --- HELPER FUNCTIONS (Run in Threads) ---
 
-def get_voyage_embedding(text: str) -> List[float]:
-    """Fetch Dense Embedding from Voyage API."""
-    return voyage_client.embed(
-        texts=[text],
-        model=VOYAGE_MODEL,
-        input_type="query"
-    ).embeddings[0]
+def get_dense_embedding(text: str) -> List[float]:
+    """Generate Dense Embedding locally using FastEmbed."""
+    embeddings = list(dense_model.embed([text]))
+    return embeddings[0].tolist()
 
 
 def get_sparse_embedding(text: str) -> models.SparseVector:
@@ -195,7 +191,7 @@ def health():
 def search_ads(request: SearchRequest):
     """
     Execute Hybrid Search with Server-Side Fusion + CPU Reranking.
-    1. Parallel: Voyage (Dense) + FastEmbed (Sparse) embeddings
+    1. Parallel: bge-small-en-v1.5 (Dense) + FastEmbed BM25 (Sparse) embeddings
     2. Server: Qdrant RRF Fusion (Dense + Sparse results)
     3. CPU: Jina TextCrossEncoder reranking for final precision
     """
@@ -217,9 +213,9 @@ def search_ads(request: SearchRequest):
         filter_time = (time.time() - filter_start) * 1000
 
         # 2. Parallel Embedding Generation
-        # This runs the Network call (Voyage) and CPU work (Sparse) at the same time
+        # This runs Dense (bge-small) and Sparse (BM25) embedding generation in parallel
         embed_start = time.time()
-        future_dense = executor.submit(get_voyage_embedding, request.query)
+        future_dense = executor.submit(get_dense_embedding, request.query)
         future_sparse = executor.submit(get_sparse_embedding, request.query)
 
         dense_vector = future_dense.result()

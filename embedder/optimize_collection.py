@@ -4,20 +4,20 @@ Optimize Qdrant collection for sub-10ms search latency with HYBRID SEARCH.
 
 This script will:
 1. Create a new optimized collection with:
-   - HYBRID SEARCH: Dense (Voyage) + Sparse (BM25) vectors
+   - HYBRID SEARCH: Dense (bge-small-en-v1.5) + Sparse (BM25) vectors
    - Scalar quantization (4x memory reduction)
    - Optimized HNSW parameters
    - In-memory storage for vectors and index
 2. Re-embed all ads using:
-   - Dense: voyage-lite-02-instruct (3x faster)
+   - Dense: BAAI/bge-small-en-v1.5 (local, ~10ms per query)
    - Sparse: Qdrant/bm25 via fastembed (keyword matching)
 3. Hybrid search combines semantic + keyword matching
 
 Expected improvements:
-- Embedding: 110ms → ~35ms (voyage-lite)
-- Qdrant search: 207ms → <10ms (quantization + RAM)
-- Search quality: Better (hybrid = semantic + keywords)
-- Total: 327ms → ~45ms
+- Embedding: ~53ms (Voyage API) → ~10ms (local bge-small)
+- Qdrant search: ~45ms → ~35ms (384 vs 512 dimensions)
+- Search quality: Maintained (reranker compensates)
+- Total: ~190ms → ~137ms
 
 Usage:
     python optimize_collection.py
@@ -27,7 +27,6 @@ import os
 import sys
 import time
 import boto3
-import voyageai
 from typing import List, Dict
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -43,7 +42,7 @@ from qdrant_client.models import (
     SparseIndexParams,
     SparseVector
 )
-from fastembed import SparseTextEmbedding
+from fastembed import SparseTextEmbedding, TextEmbedding
 from tqdm import tqdm
 from dotenv import load_dotenv
 
@@ -52,10 +51,10 @@ load_dotenv()
 # Configuration
 COLLECTION_NAME = "synthetic_ads"
 NEW_COLLECTION_NAME = "synthetic_ads_optimized"
-EMBEDDING_MODEL = "voyage-3-lite"  # Faster dense embedding
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"  # Fast local dense embedding
 SPARSE_MODEL = "Qdrant/bm25"  # BM25 sparse embedding
-EMBEDDING_DIMENSION = 512
-BATCH_SIZE = 32  # Voyage supports up to 128
+EMBEDDING_DIMENSION = 384  # bge-small uses 384 dimensions
+BATCH_SIZE = 32  # Process 32 ads at a time
 START_BATCH = 1
 END_BATCH = 100
 
@@ -112,8 +111,8 @@ def create_optimized_collection(qdrant_client: QdrantClient):
             memmap_threshold=None       # Disable memmap (force RAM)
         ),
         hnsw_config=HnswConfigDiff(
-            m=32,  # Number of connections per element (16 is good balance)
-            ef_construct=200,  # Construction time vs accuracy tradeoff
+            m=16,  # Number of connections per element (optimal for 100K vectors)
+            ef_construct=100,  # Construction time vs accuracy tradeoff
             full_scan_threshold=10000,
             on_disk=False  # Keep HNSW index in RAM for speed
         ),
@@ -131,11 +130,12 @@ def create_optimized_collection(qdrant_client: QdrantClient):
     print(f"✅ Created optimized collection '{NEW_COLLECTION_NAME}'")
     print()
     print("Optimization settings:")
-    print("  ✓ HYBRID SEARCH: Dense (Voyage) + Sparse (BM25)")
+    print("  ✓ HYBRID SEARCH: Dense (bge-small-en-v1.5) + Sparse (BM25)")
     print("  ✓ Vectors in RAM (not disk)")
     print("  ✓ HNSW index in RAM")
     print("  ✓ Scalar quantization (INT8) on dense vectors")
     print("  ✓ M=16, EF_construct=100")
+    print("  ✓ 384-dimensional embeddings")
     print()
 
 
@@ -154,29 +154,21 @@ def download_batch_from_s3(s3_client, bucket_name: str, batch_number: int) -> Li
         return []
 
 
-def generate_embeddings(voyage_client: voyageai.Client, texts: List[str]) -> List[List[float]]:
-    """Generate embeddings using Voyage AI."""
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            result = voyage_client.embed(
-                texts=texts,
-                model=EMBEDDING_MODEL,
-                input_type="document"
-            )
-            return result.embeddings
-        except Exception as e:
-            if attempt < max_retries - 1:
-                wait_time = 2 ** attempt
-                print(f"⚠️  Retry in {wait_time}s...")
-                time.sleep(wait_time)
-            else:
-                raise e
+def generate_embeddings(embedding_model: TextEmbedding, texts: List[str]) -> List[List[float]]:
+    """Generate embeddings using local FastEmbed model."""
+    try:
+        # FastEmbed returns a generator of numpy arrays
+        embeddings = list(embedding_model.embed(texts))
+        # Convert numpy arrays to lists
+        return [emb.tolist() for emb in embeddings]
+    except Exception as e:
+        print(f"❌ Error generating embeddings: {e}")
+        raise e
 
 
 def process_and_upload_batch(
     ads: List[Dict],
-    voyage_client: voyageai.Client,
+    embedding_model: TextEmbedding,
     sparse_model: SparseTextEmbedding,
     qdrant_client: QdrantClient,
     start_idx: int
@@ -195,13 +187,8 @@ def process_and_upload_batch(
     if not texts:
         return 0
 
-    # Generate DENSE embeddings in batches (Voyage AI)
-    all_dense_embeddings = []
-    for i in range(0, len(texts), BATCH_SIZE):
-        batch_texts = texts[i:i + BATCH_SIZE]
-        embeddings = generate_embeddings(voyage_client, batch_texts)
-        all_dense_embeddings.extend(embeddings)
-        time.sleep(0.1)  # Rate limiting
+    # Generate DENSE embeddings locally (much faster than API calls)
+    all_dense_embeddings = generate_embeddings(embedding_model, texts)
 
     # Generate SPARSE embeddings (BM25) for all texts at once
     sparse_embeddings = list(sparse_model.embed(texts))
@@ -289,13 +276,15 @@ def main():
     )
     print(f"✅ Connected to Qdrant at {QDRANT_URL}")
 
-    voyage_client = voyageai.Client(api_key=os.environ["VOYAGE_API_KEY"])
-    print(f"✅ Voyage AI client initialized")
+    # Initialize dense embedding model (local, no API key needed)
+    print(f"🔍 Loading dense embedding model ({EMBEDDING_MODEL})...")
+    embedding_model = TextEmbedding(model_name=EMBEDDING_MODEL)
+    print(f"✅ Dense embedding model loaded (384 dimensions)")
 
     # Initialize sparse embedding model for BM25
-    print(f"🔍 Initializing BM25 sparse embedding model ({SPARSE_MODEL})...")
+    print(f"🔍 Loading BM25 sparse embedding model ({SPARSE_MODEL})...")
     sparse_model = SparseTextEmbedding(model_name=SPARSE_MODEL)
-    print(f"✅ BM25 model initialized")
+    print(f"✅ BM25 model loaded")
 
     s3_client = boto3.client(
         's3',
@@ -320,7 +309,7 @@ def main():
         ads = download_batch_from_s3(s3_client, BUCKET_NAME, batch_num)
 
         if ads:
-            count = process_and_upload_batch(ads, voyage_client, sparse_model, qdrant_client, current_idx)
+            count = process_and_upload_batch(ads, embedding_model, sparse_model, qdrant_client, current_idx)
             total_ads += count
             current_idx += count
 
@@ -337,7 +326,7 @@ def main():
     print(f"   Name: {NEW_COLLECTION_NAME}")
     print(f"   Points: {info.points_count:,}")
     print(f"   Status: {info.status}")
-    print(f"   Vectors: Dense (voyage-3-lite) + Sparse (BM25)")
+    print(f"   Vectors: Dense (bge-small-en-v1.5, 384d) + Sparse (BM25)")
     print()
 
     # Prompt to switch collections
@@ -348,12 +337,11 @@ def main():
     print()
     print("Next steps:")
     print("1. Test the new collection first")
-    print("2. Update search_api.py: COLLECTION_NAME = 'synthetic_ads_optimized'")
-    print("3. Update search_api.py: VOYAGE_MODEL = 'voyage-3-lite'")
-    print("4. Redeploy the API")
-    print(f"5. Delete old collection: qdrant_client.delete_collection('{COLLECTION_NAME}')")
+    print("2. Update search_api.py to use local bge-small-en-v1.5 model")
+    print("3. Redeploy the API")
+    print(f"4. Delete old collection: qdrant_client.delete_collection('{COLLECTION_NAME}')")
     print()
-    print("🎉 Your search will be 7x faster!")
+    print("🎉 Your search will be ~1.4x faster with no API costs!")
 
 
 if __name__ == "__main__":
