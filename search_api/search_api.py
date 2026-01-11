@@ -246,7 +246,7 @@ def search_ads(request: SearchRequest):
                     filter=search_filter,
                     limit=PREFETCH_LIMIT, # Prefetch more for better fusion
                     params=models.SearchParams(
-                        hnsw_ef=32,  # Lower = faster search, slight accuracy trade-off
+                        hnsw_ef=64,  # Balanced accuracy/speed with gRPC
                         exact=False
                     )
                 ),
@@ -256,7 +256,7 @@ def search_ads(request: SearchRequest):
                     filter=search_filter,
                     limit=PREFETCH_LIMIT,
                     params=models.SearchParams(
-                        hnsw_ef=32,  # Lower = faster search, slight accuracy trade-off
+                        hnsw_ef=64,  # Balanced accuracy/speed with gRPC
                         exact=False
                     )
                 ),
@@ -357,5 +357,5 @@ def search_ads_get(
 
 if __name__ == "__main__":
     import uvicorn
-    # Workers=1 is fine because we use ThreadPoolExecutor for concurrency
-    uvicorn.run(app, host="0.0.0.0", port=8000, workers=4)
+    # Workers=1 is optimal - models are shared, ThreadPoolExecutor handles concurrency
+    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)
