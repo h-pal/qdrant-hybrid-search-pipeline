@@ -111,11 +111,12 @@ def create_optimized_collection(qdrant_client: QdrantClient):
         optimizers_config=OptimizersConfigDiff(
             deleted_threshold=0.2,
             vacuum_min_vector_number=1000,
-            default_segment_number=0,
-            max_optimization_threads=8, # Limit background work to 8 cores (leave rest for queries)
-            indexing_threshold=10000,   # Start indexing after 10k points
+            default_segment_number=1,    # Target 1 segment for optimal search speed
+            max_segment_size=200000,     # Allow up to 200K points per segment
+            max_optimization_threads=8,  # Limit background work to 8 cores
+            indexing_threshold=50000,    # Higher threshold = fewer segments (was 10k)
             flush_interval_sec=5,
-            memmap_threshold=None       # Disable memmap (force RAM)
+            memmap_threshold=None        # Disable memmap (force RAM)
         ),
         hnsw_config=HnswConfigDiff(
             m=32,  # Number of connections per element (optimal for 100K vectors)
@@ -142,8 +143,9 @@ def create_optimized_collection(qdrant_client: QdrantClient):
     print("  ✓ Vectors in RAM (not disk)")
     print("  ✓ HNSW index in RAM")
     print("  ✓ Scalar quantization (INT8) on dense vectors")
-    print("  ✓ M=16, EF_construct=100")
+    print("  ✓ M=32, EF_construct=200")
     print("  ✓ 384-dimensional embeddings")
+    print("  ✓ Target: 1 segment for optimal search (indexing_threshold=50K)")
     print()
 
 

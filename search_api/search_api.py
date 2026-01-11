@@ -234,8 +234,8 @@ def search_ads(request: SearchRequest):
         # fuses the ranks internally, and returns candidates for reranking.
         # Fetch 3x more results to give reranker better candidates
         search_start = time.time()
-        rerank_candidates = 25 #request.limit * 3
-        PREFETCH_LIMIT = 50
+        rerank_candidates = 20 #request.limit * 3
+        PREFETCH_LIMIT = 35
         search_results = qdrant_client.query_points(
             collection_name=COLLECTION_NAME,
             query=models.FusionQuery(fusion=models.Fusion.RRF),
@@ -246,7 +246,7 @@ def search_ads(request: SearchRequest):
                     filter=search_filter,
                     limit=PREFETCH_LIMIT, # Prefetch more for better fusion
                     params=models.SearchParams(
-                        hnsw_ef=64,  # Balanced accuracy/speed with gRPC
+                        hnsw_ef=32,  # Balanced accuracy/speed with gRPC
                         exact=False
                     )
                 ),
@@ -256,7 +256,7 @@ def search_ads(request: SearchRequest):
                     filter=search_filter,
                     limit=PREFETCH_LIMIT,
                     params=models.SearchParams(
-                        hnsw_ef=64,  # Balanced accuracy/speed with gRPC
+                        hnsw_ef=32,  # Balanced accuracy/speed with gRPC
                         exact=False
                     )
                 ),
@@ -358,4 +358,4 @@ def search_ads_get(
 if __name__ == "__main__":
     import uvicorn
     # Workers=1 is optimal - models are shared, ThreadPoolExecutor handles concurrency
-    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)
+    uvicorn.run(app, host="0.0.0.0", port=8000, workers=4)
