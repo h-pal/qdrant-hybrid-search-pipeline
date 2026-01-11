@@ -2,30 +2,34 @@
 """
 Test script for Ad Search API - HYBRID SEARCH + CPU RERANKING
 
-Pipeline: Dense (Voyage) + Sparse (BM25) → RRF Fusion → Jina Reranker
+Pipeline: bge-small (Dense) + BM25 (Sparse) → RRF Fusion → FlashRank
 
 Features:
 - Single query testing with hybrid search + reranking
-- Batch query benchmarking
-- Latency statistics (embedding, search+fusion, rerank breakdown)
+- Batch query benchmarking (10 or 1000 queries)
+- Percentile latency statistics (p50, p90, p95, p99)
+- Latency breakdown (embedding, search+fusion, rerank)
 - Category filtering tests
 - Result validation with reranker scores
 
 Usage:
-    python test_search_api.py
+    python test_search_api.py              # Run quick test (10 queries)
+    python test_search_api.py --full       # Run full benchmark (1000 queries)
 """
 
 import requests
 import time
 import json
+import sys
 from typing import List, Dict, Optional
 from statistics import mean, median, stdev
 from datetime import datetime
+import random
 
 # API Configuration
 API_URL = "https://ad-search-api-production.up.railway.app"
 
-# Test queries
+# Small test queries for quick tests
 TEST_QUERIES = [
     "cloud hosting for developers",
     "online education platform",
@@ -38,6 +42,117 @@ TEST_QUERIES = [
     "cybersecurity software",
     "AI-powered chatbot"
 ]
+
+# Generate 1000 diverse queries for comprehensive benchmarking
+def generate_1000_queries() -> List[str]:
+    """Generate 1000 realistic ad search queries."""
+
+    # Query templates and variations
+    products = [
+        "cloud hosting", "project management", "CRM software", "video editing",
+        "email marketing", "social media", "e-commerce platform", "website builder",
+        "accounting software", "HR management", "inventory system", "payment gateway",
+        "analytics tool", "chatbot", "VPN service", "antivirus", "backup solution",
+        "password manager", "form builder", "scheduling software", "CMS platform",
+        "learning management", "video conferencing", "helpdesk software", "survey tool",
+        "SEO tool", "graphic design", "photo editing", "video streaming",
+        "podcast hosting", "music streaming", "fitness app", "meal planning",
+        "meditation app", "sleep tracker", "workout planner", "nutrition guide",
+        "booking system", "appointment scheduler", "ticketing platform", "event management",
+        "invoicing software", "time tracking", "expense management", "payroll system",
+        "recruiting platform", "applicant tracking", "onboarding software", "performance review",
+        "collaboration tool", "knowledge base", "wiki platform", "documentation tool",
+        "API management", "monitoring service", "logging platform", "error tracking",
+        "database hosting", "file storage", "CDN service", "container platform"
+    ]
+
+    descriptors = [
+        "affordable", "enterprise", "small business", "startup", "professional",
+        "easy to use", "powerful", "secure", "fast", "reliable",
+        "cloud-based", "open source", "free", "premium", "scalable",
+        "mobile-friendly", "collaborative", "automated", "integrated", "customizable",
+        "AI-powered", "real-time", "advanced", "simple", "intuitive",
+        "modern", "comprehensive", "flexible", "robust", "efficient"
+    ]
+
+    use_cases = [
+        "for developers", "for teams", "for enterprises", "for startups", "for freelancers",
+        "for small business", "for marketing", "for sales", "for support", "for HR",
+        "for finance", "for healthcare", "for education", "for ecommerce", "for SaaS",
+        "for agencies", "for consultants", "for remote teams", "for productivity", "for collaboration",
+        "for content creators", "for bloggers", "for podcasters", "for YouTubers", "for influencers",
+        "for fitness enthusiasts", "for athletes", "for gym owners", "for trainers", "for coaches"
+    ]
+
+    queries = []
+
+    # Generate queries with different patterns
+    for i in range(1000):
+        pattern = i % 10
+
+        if pattern == 0:
+            # Simple product query
+            query = random.choice(products)
+        elif pattern == 1:
+            # Product + descriptor
+            query = f"{random.choice(descriptors)} {random.choice(products)}"
+        elif pattern == 2:
+            # Product + use case
+            query = f"{random.choice(products)} {random.choice(use_cases)}"
+        elif pattern == 3:
+            # Descriptor + product + use case
+            query = f"{random.choice(descriptors)} {random.choice(products)} {random.choice(use_cases)}"
+        elif pattern == 4:
+            # Question format
+            query = f"best {random.choice(products)}"
+        elif pattern == 5:
+            # Comparison format
+            query = f"{random.choice(products)} vs {random.choice(products)}"
+        elif pattern == 6:
+            # Feature-focused
+            query = f"{random.choice(products)} with {random.choice(descriptors)} features"
+        elif pattern == 7:
+            # Price-focused
+            query = f"cheap {random.choice(products)}"
+        elif pattern == 8:
+            # Problem-solution
+            query = f"how to {random.choice(products)}"
+        else:
+            # Alternative format
+            query = f"top {random.choice(products)} {random.choice(use_cases)}"
+
+        queries.append(query)
+
+    return queries
+
+# Generate the 1000 queries
+BENCHMARK_1000_QUERIES = generate_1000_queries()
+
+
+def percentile(data: List[float], p: float) -> float:
+    """
+    Calculate the p-th percentile of data.
+
+    Args:
+        data: List of numerical values
+        p: Percentile (0-100)
+
+    Returns:
+        The value at the p-th percentile
+    """
+    if not data:
+        return 0.0
+
+    sorted_data = sorted(data)
+    n = len(sorted_data)
+    k = (n - 1) * (p / 100)
+    f = int(k)
+    c = k - f
+
+    if f + 1 < n:
+        return sorted_data[f] + c * (sorted_data[f + 1] - sorted_data[f])
+    else:
+        return sorted_data[f]
 
 
 class SearchAPITester:
@@ -185,7 +300,7 @@ class SearchAPITester:
 
         print("\n" + "="*80 + "\n")
 
-        # Calculate statistics
+        # Calculate statistics with percentiles
         stats = {
             "total_queries": len(queries),
             "successful_queries": len(results),
@@ -193,6 +308,10 @@ class SearchAPITester:
             "server_latency_ms": {
                 "mean": round(mean(server_latencies), 2) if server_latencies else 0,
                 "median": round(median(server_latencies), 2) if server_latencies else 0,
+                "p50": round(percentile(server_latencies, 50), 2) if server_latencies else 0,
+                "p90": round(percentile(server_latencies, 90), 2) if server_latencies else 0,
+                "p95": round(percentile(server_latencies, 95), 2) if server_latencies else 0,
+                "p99": round(percentile(server_latencies, 99), 2) if server_latencies else 0,
                 "min": round(min(server_latencies), 2) if server_latencies else 0,
                 "max": round(max(server_latencies), 2) if server_latencies else 0,
                 "stdev": round(stdev(server_latencies), 2) if len(server_latencies) > 1 else 0
@@ -200,21 +319,37 @@ class SearchAPITester:
             "client_latency_ms": {
                 "mean": round(mean(client_latencies), 2) if client_latencies else 0,
                 "median": round(median(client_latencies), 2) if client_latencies else 0,
+                "p50": round(percentile(client_latencies, 50), 2) if client_latencies else 0,
+                "p90": round(percentile(client_latencies, 90), 2) if client_latencies else 0,
+                "p95": round(percentile(client_latencies, 95), 2) if client_latencies else 0,
+                "p99": round(percentile(client_latencies, 99), 2) if client_latencies else 0,
                 "min": round(min(client_latencies), 2) if client_latencies else 0,
                 "max": round(max(client_latencies), 2) if client_latencies else 0,
                 "stdev": round(stdev(client_latencies), 2) if len(client_latencies) > 1 else 0
             },
             "embedding_latency_ms": {
                 "mean": round(mean(embedding_latencies), 2) if embedding_latencies else 0,
-                "median": round(median(embedding_latencies), 2) if embedding_latencies else 0
+                "median": round(median(embedding_latencies), 2) if embedding_latencies else 0,
+                "p50": round(percentile(embedding_latencies, 50), 2) if embedding_latencies else 0,
+                "p90": round(percentile(embedding_latencies, 90), 2) if embedding_latencies else 0,
+                "p95": round(percentile(embedding_latencies, 95), 2) if embedding_latencies else 0,
+                "p99": round(percentile(embedding_latencies, 99), 2) if embedding_latencies else 0
             },
             "search_fusion_latency_ms": {
                 "mean": round(mean(search_fusion_latencies), 2) if search_fusion_latencies else 0,
-                "median": round(median(search_fusion_latencies), 2) if search_fusion_latencies else 0
+                "median": round(median(search_fusion_latencies), 2) if search_fusion_latencies else 0,
+                "p50": round(percentile(search_fusion_latencies, 50), 2) if search_fusion_latencies else 0,
+                "p90": round(percentile(search_fusion_latencies, 90), 2) if search_fusion_latencies else 0,
+                "p95": round(percentile(search_fusion_latencies, 95), 2) if search_fusion_latencies else 0,
+                "p99": round(percentile(search_fusion_latencies, 99), 2) if search_fusion_latencies else 0
             },
             "rerank_latency_ms": {
                 "mean": round(mean(rerank_latencies), 2) if rerank_latencies else 0,
-                "median": round(median(rerank_latencies), 2) if rerank_latencies else 0
+                "median": round(median(rerank_latencies), 2) if rerank_latencies else 0,
+                "p50": round(percentile(rerank_latencies, 50), 2) if rerank_latencies else 0,
+                "p90": round(percentile(rerank_latencies, 90), 2) if rerank_latencies else 0,
+                "p95": round(percentile(rerank_latencies, 95), 2) if rerank_latencies else 0,
+                "p99": round(percentile(rerank_latencies, 99), 2) if rerank_latencies else 0
             }
         }
 
@@ -231,38 +366,55 @@ class SearchAPITester:
 
         print("⏱️  SERVER LATENCY (Processing Time):")
         server = stats['server_latency_ms']
-        print(f"   Mean:   {server['mean']:>7.2f} ms")
-        print(f"   Median: {server['median']:>7.2f} ms")
-        print(f"   Min:    {server['min']:>7.2f} ms")
-        print(f"   Max:    {server['max']:>7.2f} ms")
-        print(f"   StdDev: {server['stdev']:>7.2f} ms")
+        print(f"   Mean:    {server['mean']:>7.2f} ms")
+        print(f"   Median:  {server['median']:>7.2f} ms")
+        print(f"   P50:     {server['p50']:>7.2f} ms")
+        print(f"   P90:     {server['p90']:>7.2f} ms")
+        print(f"   P95:     {server['p95']:>7.2f} ms")
+        print(f"   P99:     {server['p99']:>7.2f} ms")
+        print(f"   Min:     {server['min']:>7.2f} ms")
+        print(f"   Max:     {server['max']:>7.2f} ms")
+        print(f"   StdDev:  {server['stdev']:>7.2f} ms")
         print()
 
         print("🌐 CLIENT LATENCY (End-to-End):")
         client = stats['client_latency_ms']
-        print(f"   Mean:   {client['mean']:>7.2f} ms")
-        print(f"   Median: {client['median']:>7.2f} ms")
-        print(f"   Min:    {client['min']:>7.2f} ms")
-        print(f"   Max:    {client['max']:>7.2f} ms")
-        print(f"   StdDev: {client['stdev']:>7.2f} ms")
+        print(f"   Mean:    {client['mean']:>7.2f} ms")
+        print(f"   Median:  {client['median']:>7.2f} ms")
+        print(f"   P50:     {client['p50']:>7.2f} ms")
+        print(f"   P90:     {client['p90']:>7.2f} ms")
+        print(f"   P95:     {client['p95']:>7.2f} ms")
+        print(f"   P99:     {client['p99']:>7.2f} ms")
+        print(f"   Min:     {client['min']:>7.2f} ms")
+        print(f"   Max:     {client['max']:>7.2f} ms")
+        print(f"   StdDev:  {client['stdev']:>7.2f} ms")
         print()
 
         print("🤖 EMBEDDING LATENCY (Dense + Sparse):")
         emb = stats['embedding_latency_ms']
-        print(f"   Mean:   {emb['mean']:>7.2f} ms")
-        print(f"   Median: {emb['median']:>7.2f} ms")
+        print(f"   Mean:    {emb['mean']:>7.2f} ms")
+        print(f"   Median:  {emb['median']:>7.2f} ms")
+        print(f"   P90:     {emb['p90']:>7.2f} ms")
+        print(f"   P95:     {emb['p95']:>7.2f} ms")
+        print(f"   P99:     {emb['p99']:>7.2f} ms")
         print()
 
         print("🔍 SEARCH + FUSION LATENCY (Qdrant RRF):")
         search = stats['search_fusion_latency_ms']
-        print(f"   Mean:   {search['mean']:>7.2f} ms")
-        print(f"   Median: {search['median']:>7.2f} ms")
+        print(f"   Mean:    {search['mean']:>7.2f} ms")
+        print(f"   Median:  {search['median']:>7.2f} ms")
+        print(f"   P90:     {search['p90']:>7.2f} ms")
+        print(f"   P95:     {search['p95']:>7.2f} ms")
+        print(f"   P99:     {search['p99']:>7.2f} ms")
         print()
 
-        print("🎯 RERANK LATENCY (Jina TextCrossEncoder):")
+        print("🎯 RERANK LATENCY (FlashRank):")
         rerank = stats['rerank_latency_ms']
-        print(f"   Mean:   {rerank['mean']:>7.2f} ms")
-        print(f"   Median: {rerank['median']:>7.2f} ms")
+        print(f"   Mean:    {rerank['mean']:>7.2f} ms")
+        print(f"   Median:  {rerank['median']:>7.2f} ms")
+        print(f"   P90:     {rerank['p90']:>7.2f} ms")
+        print(f"   P95:     {rerank['p95']:>7.2f} ms")
+        print(f"   P99:     {rerank['p99']:>7.2f} ms")
         print()
 
         # Calculate percentages
@@ -308,10 +460,17 @@ class SearchAPITester:
 
 def main():
     """Run comprehensive API tests for Hybrid Search + Reranking API."""
+    # Check for --full flag
+    run_full_benchmark = "--full" in sys.argv or "-f" in sys.argv
+
     tester = SearchAPITester()
 
     print("="*80)
     print("🚀 AD SEARCH API - HYBRID SEARCH + RERANKING BENCHMARKING")
+    if run_full_benchmark:
+        print("   MODE: FULL BENCHMARK (1000 queries)")
+    else:
+        print("   MODE: QUICK TEST (10 queries)")
     print("="*80)
     print()
 
@@ -323,40 +482,54 @@ def main():
         return
 
     # 2. Single query example
-    print("📝 SINGLE QUERY TEST")
-    print("="*80 + "\n")
-    try:
-        result = tester.search(
-            query="cloud hosting for developers",
-            bucket_names=["cloud_services", "dev_tools"],
-            limit=5
-        )
-        tester.print_search_results(result)
-    except Exception as e:
-        print(f"❌ Search failed: {e}\n")
+    if not run_full_benchmark:
+        print("📝 SINGLE QUERY TEST")
+        print("="*80 + "\n")
+        try:
+            result = tester.search(
+                query="cloud hosting for developers",
+                bucket_names=["cloud_services", "dev_tools"],
+                limit=5
+            )
+            tester.print_search_results(result)
+        except Exception as e:
+            print(f"❌ Search failed: {e}\n")
 
     # 3. Benchmark with multiple queries
     print("🏃 BENCHMARK TEST")
     print("="*80 + "\n")
     try:
-        stats = tester.benchmark_queries(TEST_QUERIES, limit=5)
+        # Choose query set based on mode
+        if run_full_benchmark:
+            queries = BENCHMARK_1000_QUERIES
+            print(f"⚡ Running FULL benchmark with {len(queries)} queries...")
+            print(f"   This will take ~{len(queries) * 0.15:.0f} seconds (~15 minutes)")
+            print()
+        else:
+            queries = TEST_QUERIES
+
+        stats = tester.benchmark_queries(queries, limit=5)
         tester.print_benchmark_stats(stats)
 
         # Save stats to file
-        with open('benchmark_results.json', 'w') as f:
+        filename = 'benchmark_results_1000.json' if run_full_benchmark else 'benchmark_results.json'
+        with open(filename, 'w') as f:
             json.dump(stats, f, indent=2)
-        print("\n💾 Results saved to: benchmark_results.json\n")
+        print(f"\n💾 Results saved to: {filename}\n")
 
     except Exception as e:
         print(f"❌ Benchmark failed: {e}\n")
 
-    # 4. Test category filtering
-    try:
-        tester.test_categories()
-    except Exception as e:
-        print(f"❌ Category test failed: {e}\n")
+    # 4. Test category filtering (skip in full benchmark)
+    if not run_full_benchmark:
+        try:
+            tester.test_categories()
+        except Exception as e:
+            print(f"❌ Category test failed: {e}\n")
 
     print("✅ All tests completed!")
+    if not run_full_benchmark:
+        print("\n💡 Tip: Run 'python test_search_api.py --full' for 1000-query benchmark with percentiles")
 
 
 if __name__ == "__main__":
