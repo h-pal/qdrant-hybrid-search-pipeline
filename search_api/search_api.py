@@ -52,8 +52,9 @@ sparse_model: Optional[SparseTextEmbedding] = None
 reranker: Optional[Ranker] = None
 
 # Thread Executor for Parallel Embedding
-# Optimized for 32 vCPU deployment - allow more concurrent requests
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
+# NOTE: Keep at 8 until OMP_NUM_THREADS is set in Railway env vars
+# After setting OMP_NUM_THREADS=8, can increase to 16 for more concurrent capacity
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
 
 @app.on_event("startup")
