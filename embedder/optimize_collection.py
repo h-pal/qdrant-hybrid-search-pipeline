@@ -200,7 +200,7 @@ def main():
     print(f"\n✅ All batches processed. Total: {total_ads:,}")
 
     # 3. FORCE MERGE (The Secret Sauce)
-    print("\n🧹 Force Merging into 1 Segment (Defrag)...")
+    print("\n🧹 Force Merging into 2 Segment (Defrag)...")
     qdrant_client.update_collection(
         collection_name=NEW_COLLECTION_NAME,
         optimizer_config=OptimizersConfigDiff(default_segment_number=1)
@@ -210,7 +210,7 @@ def main():
     print("⏳ Waiting for optimization...")
     while True:
         info = qdrant_client.get_collection(NEW_COLLECTION_NAME)
-        if info.status == "green" and info.segments_count == 1:
+        if info.status == "green" and info.segments_count == 2:
             break
         print(f"   Status: {info.status} | Segments: {info.segments_count}")
         time.sleep(2)
